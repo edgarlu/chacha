@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="语音助手">
+<title>语音助手</title>
+<style>
+  :root {
+    --bg: #0e0f13;
+    --fg: #e8e8ea;
+    --dim: #8a8b92;
+    --accent: #4f8cff;
+    --green: #2ecc71;
+    --red: #e74c3c;
+    --orange: #f39c12;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font-family: -apple-system, "PingFang SC", sans-serif;
+    display: flex; flex-direction: column;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    overflow: hidden;
+  }
+  header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 14px 18px;
+  }
+  header h1 { font-size: 17px; font-weight: 600; }
+  #gear { font-size: 22px; background: none; border: none; color: var(--dim); cursor: pointer; }
+
+  #log {
+    flex: 1; overflow-y: auto; padding: 0 16px 12px;
+    -webkit-overflow-scrolling: touch;
+  }
+  .msg { margin: 8px 0; max-width: 86%; padding: 10px 14px; border-radius: 16px; line-height: 1.45; font-size: 16px; white-space: pre-wrap; word-break: break-word; }
+  .user { background: var(--accent); color: #fff; margin-left: auto; border-bottom-right-radius: 4px; }
+  .ai { background: #1d1f27; border-bottom-left-radius: 4px; }
+  .sys { color: var(--dim); font-size: 13px; text-align: center; background: none; max-width: 100%; padding: 4px; }
+
+  #controls {
+    padding: 10px 16px calc(18px + env(safe-area-inset-bottom));
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+  }
+  #status { font-size: 14px; color: var(--dim); height: 20px; }
+  #vu { width: 120px; height: 4px; border-radius: 2px; background: #23252e; overflow: hidden; }
+  #vufill { height: 100%; width: 0%; background: var(--green); transition: width 60ms linear; }
+
+  #bigbtn {
+    width: 96px; height: 96px; border-radius: 50%;
+    border: none; font-size: 40px; cursor: pointer;
+    background: var(--accent); color: #fff;
+    box-shadow: 0 0 0 0 rgba(79,140,255,.45);
+    transition: background .2s;
+  }
+  #bigbtn.live { background: var(--red); animation: pulse 1.6s infinite; }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(231,76,60,.45); }
+    70% { box-shadow: 0 0 0 22px rgba(231,76,60,0); }
+    100% { box-shadow: 0 0 0 0 rgba(231,76,60,0); }
+  }
+
+  /* settings */
+  #panel {
+    position: fixed; inset: 0; background: rgba(0,0,0,.6);
+    display: none; align-items: flex-end; z-index: 10;
+  }
+  #panel.show { display: flex; }
+  #panel .sheet {
+    background: #15171e; width: 100%; border-radius: 18px 18px 0 0;
+    padding: 22px 20px calc(28px + env(safe-area-inset-bottom));
+    max-height: 85%; overflow-y: auto;
+  }
+  .sheet h2 { font-size: 17px; margin-bottom: 16px; }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 13px; color: var(--dim); margin-bottom: 6px; }
+  .field input, .field select {
+    width: 100%; padding: 11px 12px; border-radius: 10px; border: 1px solid #2a2d38;
+    background: #0e0f13; color: var(--fg); font-size: 15px;
+  }
+  .sheet button.save {
+    width: 100%; padding: 13px; border-radius: 12px; border: none;
+    background: var(--accent); color: #fff; font-size: 16px; font-weight: 600; margin-top: 6px; cursor: pointer;
+  }
+  .hint { font-size: 12px; color: var(--dim); margin-top: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>语音助手</h1>
+  <button id="gear">⚙︎</button>
+</header>
+
+<div id="log"></div>
+
+<div id="controls">
+  <div id="status">点击开始对话</div>
+  <div id="vu"><div id="vufill"></div></div>
+  <button id="bigbtn">🎙</button>
+</div>
+
+<div id="panel">
+  <div class="sheet">
+    <h2>设置</h2>
+    <div class="field">
+      <label>Anthropic API Key</label>
+      <input id="set-akey" type="password" placeholder="sk-ant-...">
+    </div>
+    <div class="field">
+      <label>Groq API Key（语音转文字）</label>
+      <input id="set-gkey" type="password" placeholder="gsk_...">
+    </div>
+    <div class="field">
+      <label>模型</label>
+      <select id="set-model">
+        <option value="claude-opus-4-8">Claude Opus 4.8（最聪明）</option>
+        <option value="claude-sonnet-4-6">Claude Sonnet 4.6（更快更便宜）</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>回答详略</label>
+      <select id="set-effort">
+        <option value="low">简短快速（推荐语音对话）</option>
+        <option value="medium">中等</option>
+        <option value="high">详细深入</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>语速（0.8 ～ 1.6）</label>
+      <input id="set-rate" type="number" step="0.1" min="0.8" max="1.6" value="1.1">
+    </div>
+    <div class="field">
+      <label>静音判定（秒，说完停顿多久算结束）</label>
+      <input id="set-silence" type="number" step="0.1" min="0.5" max="3" value="1.0">
+    </div>
+    <button class="save" id="save">保存</button>
+    <p class="hint">Key 只保存在本机浏览器，不会上传到任何服务器。</p>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+/* ---------- 配置 ---------- */
+const CFG_KEY = 'voice-assistant-cfg';
+const cfg = Object.assign({
+  akey: '', gkey: '',
+  model: 'claude-opus-4-8',
+  effort: 'low',
+  rate: 1.1,
+  silence: 1.0,
+}, JSON.parse(localStorage.getItem(CFG_KEY) || '{}'));
+
+const SYSTEM_PROMPT =
+  '你是一个语音对话助手，用户通过语音和你交流，你的回答会被朗读出来。' +
+  '规则：1) 用口语化的简体中文回答；2) 绝对不要使用 Markdown、列表符号、标题、代码块等任何排版格式，只输出适合朗读的连贯自然语句；' +
+  '3) 默认简洁，两三句话说清楚，用户追问再展开；4) 数字、单位、外文名词用适合朗读的方式表达。' +
+  '用户语音经过自动转录，可能有错别字或同音字错误，请按语境理解真实意图。';
+
+/* ---------- 状态 ---------- */
+const S = { IDLE: 'idle', LISTEN: 'listen', RECORD: 'record', THINK: 'think', SPEAK: 'speak' };
+let state = S.IDLE;
+let live = false;             // 会话开关（大按钮）
+let history = [];             // Claude messages
+let mediaStream = null, audioCtx = null, analyser = null, vadTimer = null;
+let recorder = null, chunks = [];
+let voiceFrames = 0, silenceMs = 0, recStartTs = 0;
+let speakQueue = 0, streamDone = true;
+let wakeLock = null;
+let abortCtrl = null;
+
+const $ = id => document.getElementById(id);
+const logEl = $('log'), statusEl = $('status'), btn = $('bigbtn'), vufill = $('vufill');
+
+/* ---------- UI ---------- */
+function setStatus(t) { statusEl.textContent = t; }
+function addMsg(cls, text) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls;
+  d.textContent = text;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+  return d;
+}
+
+/* ---------- 设置面板 ---------- */
+$('gear').onclick = () => {
+  $('set-akey').value = cfg.akey; $('set-gkey').value = cfg.gkey;
+  $('set-model').value = cfg.model; $('set-effort').value = cfg.effort;
+  $('set-rate').value = cfg.rate; $('set-silence').value = cfg.silence;
+  $('panel').classList.add('show');
+};
+$('panel').onclick = e => { if (e.target === $('panel')) $('panel').classList.remove('show'); };
+$('save').onclick = () => {
+  cfg.akey = $('set-akey').value.trim();
+  cfg.gkey = $('set-gkey').value.trim();
+  cfg.model = $('set-model').value;
+  cfg.effort = $('set-effort').value;
+  cfg.rate = parseFloat($('set-rate').value) || 1.1;
+  cfg.silence = parseFloat($('set-silence').value) || 1.0;
+  localStorage.setItem(CFG_KEY, JSON.stringify(cfg));
+  $('panel').classList.remove('show');
+};
+
+/* ---------- 大按钮：开始 / 结束会话 ---------- */
+btn.onclick = async () => {
+  if (!live) {
+    if (!cfg.akey || !cfg.gkey) { $('gear').onclick(); addMsg('sys', '请先在设置里填入两个 API Key'); return; }
+    await startSession();
+  } else {
+    stopSession();
+  }
+};
+
+async function startSession() {
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+  } catch (e) {
+    addMsg('sys', '无法访问麦克风：' + e.message);
+    return;
+  }
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  await audioCtx.resume();
+  const src = audioCtx.createMediaStreamSource(mediaStream);
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 1024;
+  src.connect(analyser);
+
+  // iOS speechSynthesis 需要用户手势内先触发一次
+  speechSynthesis.cancel();
+  speechSynthesis.speak(new SpeechSynthesisUtterance(''));
+
+  if ('wakeLock' in navigator) {
+    try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  }
+
+  live = true;
+  btn.classList.add('live');
+  btn.textContent = '⏹';
+  addMsg('sys', '对话开始，直接说话即可');
+  enterListening();
+  vadTimer = setInterval(vadTick, 50);
+}
+
+function stopSession() {
+  live = false;
+  clearInterval(vadTimer); vadTimer = null;
+  if (abortCtrl) abortCtrl.abort();
+  speechSynthesis.cancel(); speakQueue = 0;
+  stopRecorder(true);
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  if (wakeLock) { wakeLock.release().catch(()=>{}); wakeLock = null; }
+  state = S.IDLE;
+  btn.classList.remove('live');
+  btn.textContent = '🎙';
+  vufill.style.width = '0%';
+  setStatus('点击开始对话');
+  addMsg('sys', '对话结束');
+}
+
+/* ---------- VAD：能量检测 ---------- */
+const VAD_START = 0.022;   // 开口阈值（RMS）
+const VAD_KEEP  = 0.012;   // 说话中维持阈值
+const MIN_SPEECH_MS = 350; // 短于这个的声音忽略（咳嗽、碰撞声）
+
+function rms() {
+  const buf = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(buf);
+  let s = 0;
+  for (let i = 0; i < buf.length; i++) s += buf[i] * buf[i];
+  return Math.sqrt(s / buf.length);
+}
+
+function vadTick() {
+  if (!live || !analyser) return;
+  const level = rms();
+  vufill.style.width = Math.min(100, level * 900) + '%';
+
+  if (state === S.LISTEN) {
+    if (level > VAD_START) {
+      voiceFrames++;
+      if (voiceFrames >= 2) startRecorder();   // 连续 ~100ms 有声才算开口
+    } else {
+      voiceFrames = 0;
+    }
+  } else if (state === S.RECORD) {
+    if (level > VAD_KEEP) {
+      silenceMs = 0;
+    } else {
+      silenceMs += 50;
+      if (silenceMs >= cfg.silence * 1000) finishRecording();
+    }
+  } else if (state === S.SPEAK) {
+    // 朗读时点按屏幕任意位置打断（half-duplex，不收音）
+  }
+}
+
+function enterListening() {
+  state = S.LISTEN;
+  voiceFrames = 0;
+  setStatus('🟢 聆听中…说话即可');
+}
+
+/* ---------- 录音 ---------- */
+function pickMime() {
+  for (const m of ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm']) {
+    if (MediaRecorder.isTypeSupported(m)) return m;
+  }
+  return '';
+}
+
+function startRecorder() {
+  chunks = [];
+  const mime = pickMime();
+  recorder = new MediaRecorder(mediaStream, mime ? { mimeType: mime } : {});
+  recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  recorder.start();
+  recStartTs = Date.now();
+  silenceMs = 0;
+  state = S.RECORD;
+  setStatus('🔴 正在听你说…');
+}
+
+function stopRecorder(discard) {
+  if (recorder && recorder.state !== 'inactive') {
+    if (discard) recorder.ondataavailable = null;
+    recorder.stop();
+  }
+  recorder = null;
+}
+
+function finishRecording() {
+  const dur = Date.now() - recStartTs;
+  const mime = recorder ? recorder.mimeType : 'audio/mp4';
+  if (dur < MIN_SPEECH_MS) {            // 太短，当噪音丢弃
+    stopRecorder(true);
+    enterListening();
+    return;
+  }
+  state = S.THINK;
+  setStatus('⏳ 转录中…');
+  const rec = recorder;
+  rec.onstop = () => {
+    const blob = new Blob(chunks, { type: mime });
+    chunks = [];
+    transcribeAndAsk(blob, mime);
+  };
+  recorder = null;
+  rec.stop();
+}
+
+/* ---------- 转录 (Groq Whisper) ---------- */
+async function transcribeAndAsk(blob, mime) {
+  const ext = mime.includes('mp4') ? 'm4a' : 'webm';
+  const fd = new FormData();
+  fd.append('file', blob, 'audio.' + ext);
+  fd.append('model', 'whisper-large-v3-turbo');
+  let text = '';
+  try {
+    const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + cfg.gkey },
+      body: fd
+    });
+    if (!r.ok) throw new Error('Groq ' + r.status + ' ' + (await r.text()).slice(0, 120));
+    text = (await r.json()).text.trim();
+  } catch (e) {
+    addMsg('sys', '转录失败：' + e.message);
+    if (live) enterListening();
+    return;
+  }
+  if (!text || text.length < 2) { if (live) enterListening(); return; }
+  addMsg('user', text);
+  await askClaude(text);
+}
+
+/* ---------- Claude（流式 + 逐句朗读） ---------- */
+async function askClaude(userText) {
+  state = S.THINK;
+  setStatus('🤔 思考中…');
+  history.push({ role: 'user', content: userText });
+  if (history.length > 40) history = history.slice(-40);   // 控制上下文长度
+
+  const aiDiv = addMsg('ai', '');
+  let full = '', sentenceBuf = '';
+  streamDone = false;
+  abortCtrl = new AbortController();
+
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      signal: abortCtrl.signal,
+      headers: {
+        'x-api-key': cfg.akey,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true',
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: cfg.model,
+        max_tokens: 2000,
+        system: SYSTEM_PROMPT,
+        messages: history,
+        thinking: { type: 'adaptive' },
+        output_config: { effort: cfg.effort },
+        stream: true
+      })
+    });
+    if (!r.ok) throw new Error('Claude ' + r.status + ' ' + (await r.text()).slice(0, 200));
+
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        let ev;
+        try { ev = JSON.parse(line.slice(6)); } catch (e) { continue; }
+        if (ev.type === 'content_block_delta' && ev.delta && ev.delta.type === 'text_delta') {
+          const t = ev.delta.text;
+          full += t; sentenceBuf += t;
+          aiDiv.textContent = full;
+          logEl.scrollTop = logEl.scrollHeight;
+          sentenceBuf = flushSentences(sentenceBuf, false);
+        }
+      }
+    }
+    flushSentences(sentenceBuf, true);
+    streamDone = true;
+    history.push({ role: 'assistant', content: full });
+    if (speakQueue === 0 && live) enterListening();   // 极短回答可能已读完
+  } catch (e) {
+    streamDone = true;
+    if (e.name !== 'AbortError') {
+      history.pop();   // 失败的提问移出历史
+      addMsg('sys', '出错：' + e.message);
+    }
+    if (live && speakQueue === 0) enterListening();
+  }
+  abortCtrl = null;
+}
+
+/* 把缓冲区里完整的句子送去朗读，返回剩余未完结部分 */
+function flushSentences(buf, flushAll) {
+  if (flushAll) {
+    if (buf.trim()) speak(buf.trim());
+    return '';
+  }
+  let rest = buf;
+  for (;;) {
+    const m = rest.match(/^[\s\S]*?[。！？!?；;\n]+/);
+    if (!m || m[0].trim().length < 4) break;
+    speak(m[0].trim());
+    rest = rest.slice(m[0].length);
+  }
+  return rest;
+}
+
+/* ---------- 朗读（iOS 本地语音合成，half-duplex） ---------- */
+function speak(text) {
+  if (!live) return;
+  state = S.SPEAK;
+  setStatus('🔊 朗读中…点屏幕打断');
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = /[一-鿿]/.test(text) ? 'zh-CN' : 'en-US';
+  u.rate = cfg.rate;
+  speakQueue++;
+  u.onend = u.onerror = () => {
+    speakQueue--;
+    if (speakQueue <= 0 && streamDone && live && state === S.SPEAK) enterListening();
+  };
+  speechSynthesis.speak(u);
+}
+
+/* 朗读时点屏幕打断，立刻回到聆听 */
+document.body.addEventListener('click', e => {
+  if (state !== S.SPEAK) return;
+  if (e.target.closest('#panel') || e.target.closest('#gear') || e.target === btn) return;
+  speechSynthesis.cancel();
+  speakQueue = 0;
+  if (abortCtrl) abortCtrl.abort();
+  streamDone = true;
+  if (live) enterListening();
+});
+
+/* 页面隐藏再回来时，wake lock 需要重新申请 */
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && live && 'wakeLock' in navigator) {
+    try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  }
+});
+</script>
+</body>
+</html>
