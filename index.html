@@ -108,7 +108,7 @@
 <div id="log"></div>
 
 <div id="controls">
-  <div id="status">点击开始对话1</div>
+  <div id="status">点击开始对话</div>
   <div id="vu"><div id="vufill"></div></div>
   <button id="bigbtn">🎙</button>
   <div id="textrow">
@@ -255,21 +255,36 @@ btn.onclick = async () => {
   }
 };
 
-async function startSession() {
+/* 获取/释放麦克风。iOS 上麦克风占用期间语音合成会被静音，
+   所以朗读时必须彻底释放麦克风，读完再重新获取 */
+async function acquireMic() {
+  if (mediaStream) return true;
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     });
   } catch (e) {
     addMsg('sys', '无法访问麦克风：' + e.message);
-    return;
+    return false;
   }
-  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (!audioCtx || audioCtx.state === 'closed') {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
   await audioCtx.resume();
   const src = audioCtx.createMediaStreamSource(mediaStream);
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = 1024;
   src.connect(analyser);
+  return true;
+}
+
+function releaseMic() {
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+  analyser = null;
+}
+
+async function startSession() {
+  if (!(await acquireMic())) return;
 
   unlockTTS();
 
@@ -291,7 +306,7 @@ function stopSession() {
   if (abortCtrl) abortCtrl.abort();
   speechSynthesis.cancel(); speakQueue = 0;
   stopRecorder(true);
-  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+  releaseMic();
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
   if (wakeLock) { wakeLock.release().catch(()=>{}); wakeLock = null; }
   state = S.IDLE;
@@ -339,7 +354,13 @@ function vadTick() {
   }
 }
 
-function enterListening() {
+async function enterListening() {
+  if (!live) return;
+  if (!mediaStream) {                 // 朗读后麦克风已释放，重新获取
+    setStatus('…');
+    if (!(await acquireMic())) { stopSession(); return; }
+    if (!live) { releaseMic(); return; }   // 获取期间用户结束了会话
+  }
   state = S.LISTEN;
   voiceFrames = 0;
   setStatus('🟢 聆听中…说话即可');
@@ -422,6 +443,7 @@ async function transcribeAndAsk(blob, mime) {
 async function askClaude(userText) {
   state = S.THINK;
   setStatus('🤔 思考中…');
+  if (live) releaseMic();   // iOS：占着麦克风时语音合成不出声，思考/朗读期间先释放
   history.push({ role: 'user', content: userText });
   if (history.length > 40) history = history.slice(-40);   // 控制上下文长度
 
