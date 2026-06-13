@@ -152,6 +152,8 @@
       <input id="set-silence" type="number" step="0.1" min="0.5" max="3" value="1.0">
     </div>
     <button class="save" id="save">保存</button>
+    <button class="save" id="test" style="background:#2a2d38;margin-top:10px">测试连接</button>
+    <p id="testout" class="hint" style="white-space:pre-wrap"></p>
     <p class="hint">Key 只保存在本机浏览器，不会上传到任何服务器。</p>
   </div>
 </div>
@@ -209,15 +211,38 @@ $('gear').onclick = () => {
   $('panel').classList.add('show');
 };
 $('panel').onclick = e => { if (e.target === $('panel')) $('panel').classList.remove('show'); };
+const cleanKey = s => s.replace(/[^\x21-\x7e]/g, '');   // 去掉空格、换行、全角等不可见字符
 $('save').onclick = () => {
-  cfg.akey = $('set-akey').value.trim();
-  cfg.gkey = $('set-gkey').value.trim();
+  cfg.akey = cleanKey($('set-akey').value);
+  cfg.gkey = cleanKey($('set-gkey').value);
   cfg.model = $('set-model').value;
   cfg.effort = $('set-effort').value;
   cfg.rate = parseFloat($('set-rate').value) || 1.1;
   cfg.silence = parseFloat($('set-silence').value) || 1.0;
   localStorage.setItem(CFG_KEY, JSON.stringify(cfg));
   $('panel').classList.remove('show');
+};
+
+/* 测试连接：分别探测 Groq 与 Anthropic，显示具体错误 */
+$('test').onclick = async () => {
+  const out = $('testout');
+  const ak = cleanKey($('set-akey').value), gk = cleanKey($('set-gkey').value);
+  out.textContent = '测试中…';
+  const lines = [];
+  try {
+    const r = await fetch('https://api.groq.com/openai/v1/models', { headers: { 'Authorization': 'Bearer ' + gk } });
+    lines.push(r.ok ? '✅ Groq 连接正常' : '❌ Groq HTTP ' + r.status + '：' + (await r.text()).slice(0, 100));
+  } catch (e) { lines.push('❌ Groq 网络不通：' + e.message); }
+  out.textContent = lines.join('\n') + '\n…';
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': ak, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] })
+    });
+    lines.push(r.ok ? '✅ Anthropic 连接正常' : '❌ Anthropic HTTP ' + r.status + '：' + (await r.text()).slice(0, 150));
+  } catch (e) { lines.push('❌ Anthropic 网络不通：' + e.message); }
+  out.textContent = lines.join('\n');
 };
 
 /* ---------- 大按钮：开始 / 结束会话 ---------- */
