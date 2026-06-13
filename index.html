@@ -144,7 +144,11 @@
     <button class="save" id="save">保存</button>
     <button class="save" id="test" style="background:#2a2d38;margin-top:10px">测试连接</button>
     <p id="testout" class="hint" style="white-space:pre-wrap"></p>
-    <p class="hint">所有 Key 只保存在本机浏览器，不会上传到任何服务器。</p>
+    <div class="sec">对话记录（本地保存，最多 100 条）</div>
+    <button class="save" id="viewmem" style="background:#2a2d38">查看全部记录 <span id="memcount"></span></button>
+    <div id="memlist" style="display:none;margin-top:10px;max-height:240px;overflow-y:auto;font-size:13px;line-height:1.5;border:1px solid #2a2d38;border-radius:10px;padding:10px"></div>
+    <button class="save" id="clearmem" style="background:#3a1f1f;color:#ff9b9b;margin-top:10px">清空对话记录</button>
+    <p class="hint">所有 Key 和对话记录只保存在本机浏览器，不会上传到任何服务器。</p>
   </div>
 </div>
 
@@ -162,6 +166,11 @@ const GEM_MODEL = 'gemini-3.5-flash';
 const TTS_MODEL = 'gemini-3.1-flash-tts-preview';
 const GROK_MODEL = 'grok-4.3';
 
+// 本地历史：持久化保存，平时给模型最近 20 条，要求"搜索记录"时给 50 条
+const HIST_KEY = 'voice-assistant-history';
+const CTX_NORMAL = 20, CTX_SEARCH = 50, STORE_MAX = 100;
+const SEARCH_RE = /搜索记录|搜记录|查记录|查询记录|查一下记录|翻记录|翻一下记录|翻翻记录|找记录|找一下记录|历史记录|查历史|搜历史|聊天记录|回顾一下|回顾我们|回顾之前|之前我们|我们之前|之前聊过|之前说过|之前提到|之前讲过|上次说|上次聊|上次提到|前面提到|前面说过|前面讲过|早些时候说|你还记不记得|还记不记得|记不记得之前/;
+
 const SYSTEM_PROMPT =
   '你是一个语音对话助手，用户通过语音和你交流，你的回答会被朗读出来。' +
   '规则：1) 用口语化的简体中文回答；2) 绝对不要使用 Markdown、列表符号、星号、标题、代码块等任何排版格式，只输出适合朗读的连贯自然语句；' +
@@ -176,11 +185,13 @@ const X_SYSTEM =
 /* ===================== 状态 ===================== */
 const S = { IDLE:'idle', LISTEN:'listen', RECORD:'record', THINK:'think', SPEAK:'speak' };
 let state = S.IDLE, live = false;
-let history = [];   // [{role:'user'|'assistant', text}]
+let history = loadHistory();   // [{role:'user'|'assistant', text}]，从 localStorage 恢复
 let mediaStream = null, audioCtx = null, analyser = null, vadTimer = null;
 let recorder = null, chunks = [];
 let voiceFrames = 0, bargeFrames = 0, silenceMs = 0, recStartTs = 0;
+let probeRec = null, probeChunks = [], probing = false, probeBusy = false, probeSilence = 0, probeStartTs = 0;
 let speakQueue = 0, streamDone = true, genId = 0, ttsChain = Promise.resolve(), curSource = null;
+let thinkNodes = null, firstChunk = false;
 let abortCtrl = null, wakeLock = null;
 
 const $ = id => document.getElementById(id);
@@ -306,7 +317,7 @@ async function startSession(){
   if ('wakeLock' in navigator){ try { wakeLock = await navigator.wakeLock.request('screen'); } catch(e){} }
   live = true;
   btn.classList.add('live'); btn.textContent = '⏹';
-  addMsg('sys', '对话开始，直接说话即可。朗读时说话可打断');
+  addMsg('sys', '对话开始，直接说话即可。朗读时说"谢谢"可打断，也可点屏幕或按耳机/眼镜的暂停键');
   enterListening();
   vadTimer = setInterval(vadTick, 50);
 }
@@ -334,16 +345,24 @@ function vadTick(){
   if (!live || !analyser) return;
   const level = rms();
   vufill.style.width = Math.min(100, level*900) + '%';
+  if (probeBusy) return;
+  if (probing){
+    if (level > VAD_KEEP) probeSilence = 0;
+    else { probeSilence += 50; if (probeSilence >= cfg.silence*1000) finishProbe(); }
+    return;
+  }
   if (state === S.LISTEN){
     if (level > VAD_START){ if (++voiceFrames >= 2) startRecorder(); } else voiceFrames = 0;
   } else if (state === S.RECORD){
     if (level > VAD_KEEP) silenceMs = 0;
     else { silenceMs += 50; if (silenceMs >= cfg.silence*1000) finishRecording(); }
   } else if (state === S.SPEAK){
-    if (level > VAD_BARGE){ if (++bargeFrames >= 4) bargeIn(); } else bargeFrames = 0;
+    // 朗读时不再一有声音就打断：先把这段话录下来，转录后只有含"谢谢"才停止
+    if (level > VAD_BARGE){ if (++bargeFrames >= 4) startProbe(); } else bargeFrames = 0;
   }
 }
 function enterListening(){
+  stopThinking();
   if (!live) return;
   state = S.LISTEN; voiceFrames = 0; bargeFrames = 0;
   setStatus('🟢 聆听中…说话即可');
@@ -372,30 +391,60 @@ function finishRecording(){
   const mime = recorder ? recorder.mimeType : 'audio/mp4';
   if (dur < MIN_SPEECH_MS){ stopRecorder(true); enterListening(); return; }
   state = S.THINK; setStatus('⏳ 转录中…');
+  startThinking();                       // 转录+思考期间放等待音
   const rec = recorder; recorder = null;
   rec.onstop = () => { const blob = new Blob(chunks, {type:mime}); chunks = []; transcribeAndAsk(blob, mime); };
   rec.stop();
 }
-function bargeIn(){
-  stopPlayback();
-  setStatus('🔴 在听你说…');
-  startRecorder();
+/* 朗读中：录下用户这段话作为"是否说了谢谢"的候选，期间不打断朗读 */
+function startProbe(){
+  if (!mediaStream || state !== S.SPEAK) return;
+  probeChunks = [];
+  const mime = pickMime();
+  probeRec = new MediaRecorder(mediaStream, mime ? {mimeType:mime} : {});
+  probeRec.ondataavailable = e => { if (e.data.size) probeChunks.push(e.data); };
+  probeRec.start(); probeStartTs = Date.now(); probeSilence = 0; probing = true;
+}
+async function finishProbe(){
+  probing = false; probeBusy = true; bargeFrames = 0;
+  const dur = Date.now() - probeStartTs;
+  const mime = probeRec ? probeRec.mimeType : 'audio/mp4';
+  const rec = probeRec; probeRec = null;
+  await new Promise(res => { rec.onstop = res; try { rec.stop(); } catch(e){ res(); } });
+  const blob = new Blob(probeChunks, {type:mime}); probeChunks = [];
+  if (dur < MIN_SPEECH_MS){ probeBusy = false; return; }   // 太短，忽略
+  let text = '';
+  try { text = await transcribe(blob, mime); } catch(e){ text = ''; }
+  const norm = text.replace(/\s/g, '');
+  const isThanks = /谢谢|謝謝|thankyou|thanks/i.test(norm);
+  if (isThanks){
+    stopPlayback();
+    const after = text.replace(/^[\s\S]*?(?:谢谢|謝謝)(?:[\s,，。.!！、:：…]*(?:谢谢|謝謝))*[\s,，。.!！、:：…]*/, '').trim();
+    if (after.length >= 2){ addMsg('user', after); probeBusy = false; await ask(after); return; }
+    addMsg('sys', '（听到"谢谢"，已停止，请说你的问题）');
+    probeBusy = false; enterListening(); return;
+  }
+  // 不是"谢谢"：忽略这段插话，继续
+  probeBusy = false;
+  if (state !== S.SPEAK && live && speakQueue === 0) enterListening();
 }
 
 /* ===================== 转录（Groq Whisper） ===================== */
-async function transcribeAndAsk(blob, mime){
+async function transcribe(blob, mime){
   const ext = mime.includes('mp4') ? 'm4a' : 'webm';
   const fd = new FormData();
   fd.append('file', blob, 'audio.'+ext);
   fd.append('model', 'whisper-large-v3-turbo');
+  const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+    method:'POST', headers:{Authorization:'Bearer '+cfg.gkey}, body: fd
+  });
+  if (!r.ok) throw new Error('Groq '+r.status+' '+(await r.text()).slice(0,120));
+  return (await r.json()).text.trim();
+}
+async function transcribeAndAsk(blob, mime){
   let text = '';
-  try {
-    const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
-      method:'POST', headers:{Authorization:'Bearer '+cfg.gkey}, body: fd
-    });
-    if (!r.ok) throw new Error('Groq '+r.status+' '+(await r.text()).slice(0,120));
-    text = (await r.json()).text.trim();
-  } catch(e){ addMsg('sys','转录失败：'+e.message); if (live) enterListening(); return; }
+  try { text = await transcribe(blob, mime); }
+  catch(e){ addMsg('sys','转录失败：'+e.message); if (live) enterListening(); return; }
   if (!text || text.length < 2){ if (live) enterListening(); return; }
   if (handleCommand(text)){ addMsg('user', text); return; }
   addMsg('user', text);
@@ -403,26 +452,108 @@ async function transcribeAndAsk(blob, mime){
 }
 
 /* ===================== 主流程：Gemini 答 → 可选 Grok 追加 X 讨论 ===================== */
+/* ===================== 本地历史持久化 ===================== */
+function loadHistory(){
+  try {
+    const arr = JSON.parse(localStorage.getItem(HIST_KEY) || '[]');
+    if (!Array.isArray(arr)) return [];
+    const out = [];
+    for (const m of arr){
+      if (!m || (m.role !== 'user' && m.role !== 'assistant') || typeof m.text !== 'string') continue;
+      if (out.length && out[out.length-1].role === m.role) continue;   // 跳过连续同角色，保证交替
+      out.push({ role: m.role, text: m.text });
+    }
+    return out;
+  } catch(e){ return []; }
+}
+function updateMemCount(){ const el = $('memcount'); if (el) el.textContent = '(' + history.length + ')'; }
+function saveHistory(){
+  if (history.length > STORE_MAX) history.splice(0, history.length - STORE_MAX);   // 原地裁剪，保持引用不变
+  try { localStorage.setItem(HIST_KEY, JSON.stringify(history)); }
+  catch(e){
+    // 配额满：只尝试存裁剪版本，绝不改动内存里的 history
+    try { localStorage.setItem(HIST_KEY, JSON.stringify(history.slice(-CTX_SEARCH))); } catch(e2){}
+  }
+  updateMemCount();
+  if ($('memlist') && $('memlist').style.display !== 'none') renderMemList();
+}
+function clearHistory(){
+  stopPlayback();                                  // 中断在途流式/播放，作废当前轮
+  if (live) enterListening(); else { state = S.IDLE; setStatus('点击开始对话'); }
+  history.length = 0;                              // 原地清空，保持引用
+  try { localStorage.removeItem(HIST_KEY); } catch(e){}
+  logEl.innerHTML = '';
+  addMsg('sys', '已清空对话记录');
+  updateMemCount();
+}
+function isSearchQuery(t){ return SEARCH_RE.test(t); }
+/* 设置里查看 / 清空全部本地记录 */
+function renderMemList(){
+  const box = $('memlist');
+  const snap = history.slice();                   // 快照，避免渲染期间被改
+  updateMemCount();
+  if (!snap.length){ box.innerHTML = '<span style="color:var(--dim)">（暂无记录）</span>'; return; }
+  box.innerHTML = '';
+  for (const m of snap){
+    const row = document.createElement('div');
+    row.style.margin = '4px 0';
+    row.innerHTML = '<b style="color:' + (m.role==='user'?'#4f8cff':'#8a8b92') + '">' + (m.role==='user'?'我':'助手') + '：</b>';
+    row.appendChild(document.createTextNode(m.text));
+    box.appendChild(row);
+  }
+}
+$('viewmem').onclick = () => {
+  const box = $('memlist');
+  if (box.style.display === 'none'){ renderMemList(); box.style.display = 'block'; }
+  else box.style.display = 'none';
+};
+$('clearmem').onclick = () => {
+  if (!history.length){ addMsg('sys','没有可清空的记录'); return; }
+  clearHistory(); renderMemList();
+};
+/* 启动时把已保存的历史渲染到对话区，保持连贯 */
+function renderHistoryOnLoad(){
+  if (!history.length) return;
+  const recent = history.slice(-8);
+  addMsg('sys', '已恢复历史对话（共 ' + history.length + ' 条，显示最近 ' + recent.length + ' 条）');
+  for (const m of recent) addMsg(m.role === 'assistant' ? 'ai' : 'user', m.text);
+}
+/* 取给模型的上下文：交替对齐、去掉开头多余的 assistant，确保以 user 开头 */
+function buildContext(searching){
+  let ctx = history.slice(-(searching ? CTX_SEARCH : CTX_NORMAL));
+  while (ctx.length && ctx[0].role === 'assistant') ctx = ctx.slice(1);          // 去开头多余 assistant
+  while (ctx.length && ctx[ctx.length-1].role === 'assistant') ctx = ctx.slice(0,-1); // 去尾部多余 assistant
+  return ctx;
+}
+
 async function ask(userText){
   state = S.THINK; setStatus('🤔 思考中…');
-  history.push({ role:'user', text:userText });
-  if (history.length > 40) history = history.slice(-40);
+  startThinking();
+  firstChunk = true;
+  // 清掉上一轮被打断、没有应答的悬空 user 消息，避免出现连续 user
+  if (history.length && history[history.length-1].role === 'user') history.pop();
+  const userMsg = { role:'user', text:userText };
+  history.push(userMsg);
+  const searching = isSearchQuery(userText);
+  if (searching) addMsg('sys', '🔎 搜索记录模式：回看最近 ' + CTX_SEARCH + ' 条对话');
+  const ctx = buildContext(searching);
 
   streamDone = false; genId++; const myGen = genId;
   abortCtrl = new AbortController();
+  let assistantPushed = false;
 
   try {
     // —— 第一段：Gemini + 谷歌搜索 ——
     const aiDiv = addMsg('ai', '');
     let full = '', sb = '';
-    await streamGemini(t => {
+    await streamGemini(ctx, t => {
       if (genId !== myGen) return;
       full += t; sb += t; aiDiv.textContent = full; logEl.scrollTop = logEl.scrollHeight;
       sb = flushSentences(sb, false);
     }, myGen);
     if (genId !== myGen) return;
     flushSentences(sb, true);
-    if (full.trim()) history.push({ role:'assistant', text: full });
+    if (full.trim()){ history.push({ role:'assistant', text: full }); assistantPushed = true; }
 
     // —— 第二段：Grok 追加 X(推特) 实时讨论 ——
     if (cfg.xaiOn && cfg.xaikey && genId === myGen){
@@ -446,20 +577,26 @@ async function ask(userText){
     if (genId === myGen && speakQueue === 0) backToIdleOrListen();
   } catch(e){
     streamDone = true;
-    if (e.name !== 'AbortError'){ if (history.length && history[history.length-1].role==='user') history.pop(); addMsg('sys','出错：'+e.message); }
+    if (e.name !== 'AbortError'){ addMsg('sys','出错：'+e.message); }
     if (genId === myGen && speakQueue === 0) backToIdleOrListen();
+  } finally {
+    // 未应答（出错或被打断）则移除这条 user，保持历史干净
+    if (!assistantPushed && history[history.length-1] === userMsg) history.pop();
+    saveHistory();
+    if (genId === myGen) abortCtrl = null;
   }
-  if (genId === myGen) abortCtrl = null;
 }
 function backToIdleOrListen(){
+  stopThinking();
   if (live) enterListening();
   else { state = S.IDLE; setStatus('点击开始对话'); }
 }
 
-/* 通用 SSE 读取 */
-async function readSSE(resp, onObj){
+/* 通用 SSE 读取；alive() 返回 false 时主动停止读取（被打断时省带宽） */
+async function readSSE(resp, onObj, alive){
   const reader = resp.body.getReader(); const dec = new TextDecoder(); let buf = '';
   while (true){
+    if (alive && !alive()){ try { reader.cancel(); } catch(e){} return; }
     const { done, value } = await reader.read(); if (done) break;
     buf += dec.decode(value, {stream:true});
     const lines = buf.split('\n'); buf = lines.pop();
@@ -473,8 +610,8 @@ async function readSSE(resp, onObj){
     }
   }
 }
-async function streamGemini(onText, myGen){
-  const contents = history.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts:[{text:m.text}] }));
+async function streamGemini(ctx, onText, myGen){
+  const contents = ctx.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts:[{text:m.text}] }));
   const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEM_MODEL}:streamGenerateContent?alt=sse&key=${cfg.gemkey}`, {
     method:'POST', signal: abortCtrl.signal, headers:{'content-type':'application/json'},
     body: JSON.stringify({
@@ -486,7 +623,7 @@ async function streamGemini(onText, myGen){
   await readSSE(r, obj => {
     const parts = obj.candidates && obj.candidates[0] && obj.candidates[0].content && obj.candidates[0].content.parts;
     if (parts) for (const p of parts) if (p.text) onText(p.text);
-  });
+  }, () => genId === myGen);
 }
 async function streamGrokX(topic, mainAnswer, onText, myGen){
   const messages = [
@@ -505,19 +642,66 @@ async function streamGrokX(topic, mainAnswer, onText, myGen){
   await readSSE(r, obj => {
     const d = obj.choices && obj.choices[0] && obj.choices[0].delta;
     if (d && d.content) onText(d.content);
-  });
+  }, () => genId === myGen);
 }
 
+/* 找到一个适合断句的位置：返回切点下标（含标点），找不到返回 -1。
+   首块允许在逗号处断，让第一段音频尽快出声；至少 4 字才断，避免太碎。 */
+function nextBreak(s, allowComma){
+  const puncts = allowComma ? '。！？!?；;，,、\n' : '。！？!?；;\n';
+  for (let i = 0; i < s.length; i++){
+    if (puncts.indexOf(s[i]) >= 0 && i + 1 >= 4) return i + 1;
+  }
+  return -1;
+}
+const stripX = s => s.replace(/^📱 X 上的讨论\s*/, '');
 /* 把缓冲里完整的句子送去朗读，返回剩余未完结部分 */
 function flushSentences(buf, flushAll){
-  if (flushAll){ if (buf.trim()) speak(buf.trim()); return ''; }
+  if (flushAll){ const t = stripX(buf.trim()); if (t){ speak(t); firstChunk = false; } return ''; }
   let rest = buf;
   for (;;){
-    const m = rest.match(/^[\s\S]*?[。！？!?；;\n]+/);
-    if (!m || m[0].trim().length < 4) break;
-    speak(m[0].trim().replace(/^📱 X 上的讨论\s*/, '')); rest = rest.slice(m[0].length);
+    let idx = nextBreak(rest, firstChunk);
+    if (idx < 0 && firstChunk && stripX(rest).length >= 16) idx = rest.length;  // 首块即使没标点，攒够也先出声
+    if (idx < 0) break;
+    const seg = stripX(rest.slice(0, idx).trim());
+    if (seg){ speak(seg); firstChunk = false; }
+    rest = rest.slice(idx);
   }
   return rest;
+}
+
+/* ===================== 等待音（思考时的柔和波浪声） ===================== */
+function startThinking(){
+  if (!audioCtx || audioCtx.state !== 'running' || thinkNodes) return;
+  const ctx = audioCtx, t0 = ctx.currentTime;
+  const len = Math.floor(ctx.sampleRate * 2);
+  const nb = ctx.createBuffer(1, len, ctx.sampleRate);
+  const d = nb.getChannelData(0);
+  let last = 0;
+  for (let i = 0; i < len; i++){ const w = Math.random()*2-1; last = (last + 0.02*w)/1.02; d[i] = last*3.2; } // 棕噪声
+  const noise = ctx.createBufferSource(); noise.buffer = nb; noise.loop = true;
+  const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 480; bp.Q.value = 0.8;
+  const gain = ctx.createGain(); gain.gain.value = 0.0001;
+  const lfo = ctx.createOscillator(); lfo.frequency.value = 0.45;                 // 慢速起伏
+  const lfoGain = ctx.createGain(); lfoGain.gain.value = 0.03;
+  lfo.connect(lfoGain); lfoGain.connect(gain.gain);
+  noise.connect(bp); bp.connect(gain); gain.connect(ctx.destination);
+  gain.gain.setValueAtTime(0.0001, t0);
+  gain.gain.exponentialRampToValueAtTime(0.055, t0 + 0.4);                         // 渐入
+  noise.start(); lfo.start();
+  thinkNodes = { noise, lfo, gain, lfoGain };
+}
+function stopThinking(){
+  if (!thinkNodes) return;
+  const { noise, lfo, gain, lfoGain } = thinkNodes; thinkNodes = null;
+  try {
+    const t = audioCtx.currentTime;
+    lfoGain.gain.setValueAtTime(0, t);
+    gain.gain.cancelScheduledValues(t);
+    gain.gain.setValueAtTime(Math.max(gain.gain.value, 0.0001), t);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.15);                      // 渐出
+  } catch(e){}
+  setTimeout(() => { try { noise.stop(); } catch(e){} try { lfo.stop(); } catch(e){} }, 250);
 }
 
 /* ===================== 朗读（Gemini TTS → Web Audio） ===================== */
@@ -561,6 +745,7 @@ function speak(text){
 function playBuffer(buf, myGen){
   return new Promise(res => {
     if (genId !== myGen){ res(); return; }
+    stopThinking();                       // 第一段真实语音开始播 → 停掉等待音
     const src = audioCtx.createBufferSource();
     src.buffer = buf; src.playbackRate.value = cfg.rate;
     src.connect(audioCtx.destination);
@@ -569,10 +754,17 @@ function playBuffer(buf, myGen){
     try { src.start(); } catch(e){ res(); }
   });
 }
+function cleanupProbe(){
+  probing = false; probeBusy = false; probeSilence = 0; bargeFrames = 0;
+  if (probeRec && probeRec.state !== 'inactive'){ probeRec.ondataavailable = null; try { probeRec.stop(); } catch(e){} }
+  probeRec = null; probeChunks = [];
+}
 function stopPlayback(){
   genId++;
   ttsChain = Promise.resolve();
   speakQueue = 0; streamDone = true;
+  stopThinking();
+  cleanupProbe();
   if (curSource){ try { curSource.stop(); } catch(e){} curSource = null; }
   if (abortCtrl){ try { abortCtrl.abort(); } catch(e){} }
 }
@@ -608,7 +800,23 @@ document.addEventListener('visibilitychange', async () => {
   }
 });
 
+/* 外设暂停键（蓝牙耳机 / Meta 眼镜侧键 / 键盘媒体键）→ 打断朗读 */
+function externalStop(){
+  if (state === S.SPEAK || speakQueue > 0){ stopPlayback(); backToIdleOrListen(); return true; }
+  return false;
+}
+if ('mediaSession' in navigator){
+  try { navigator.mediaSession.metadata = new MediaMetadata({ title:'语音助手', artist:'对话中' }); } catch(e){}
+  for (const a of ['pause','stop']){ try { navigator.mediaSession.setActionHandler(a, externalStop); } catch(e){} }
+  try { navigator.mediaSession.setActionHandler('play', () => { if (live) enterListening(); }); } catch(e){}
+}
+document.addEventListener('keydown', e => {
+  if (e.key === 'MediaPlayPause' || e.key === 'MediaStop' || e.code === 'MediaPlayPause'){ externalStop(); }
+});
+
 refreshXUI();
+updateMemCount();
+renderHistoryOnLoad();
 </script>
 </body>
 </html>
